@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oramasys-anamnesis"
+version = "1.9.0"
+description = "Epistemic memory, provenance/audit ledger, and controlled promotion for Oramasys"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anamnesis"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
