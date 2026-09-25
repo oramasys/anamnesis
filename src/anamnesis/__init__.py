@@ -13,9 +13,32 @@ from .ledger import (
     verify_hash_chain,
 )
 from .promotion import PromotionPipeline, PromotionState
+from .retrieval import (
+    AuthorizationRecord,
+    AuthorizationRegistry,
+    ContextFragment,
+    ContextInjectionBoundary,
+    DenyReason,
+    InjectCandidate,
+    InjectedContext,
+    RetrievalAuditEvent,
+    RetrievalDecision,
+    RetrievalGate,
+    RetrievalPrincipal,
+    RetrievalVerdict,
+    TrustTier,
+    UnauthorizedContextError,
+)
 
 __all__ = [
+    "AuthorizationRecord",
+    "AuthorizationRegistry",
+    "ContextFragment",
+    "ContextInjectionBoundary",
+    "DenyReason",
     "GENESIS_HASH",
+    "InjectCandidate",
+    "InjectedContext",
     "Ledger",
     "LedgerBackend",
     "LedgerRecord",
@@ -24,7 +47,14 @@ __all__ = [
     "PreWriteGate",
     "PromotionPipeline",
     "PromotionState",
+    "RetrievalAuditEvent",
+    "RetrievalDecision",
+    "RetrievalGate",
+    "RetrievalPrincipal",
+    "RetrievalVerdict",
     "SQLiteLedgerBackend",
+    "TrustTier",
+    "UnauthorizedContextError",
     "compute_record_hash",
     "verify_hash_chain",
 ]

@@ -18,3 +18,9 @@ silent production default; tests may use `Ledger.unrestricted_for_tests()`.
 **Durable provenance (PR2):** `SQLiteLedgerBackend` provides transactional
 append and a SHA-256 `record_hash` / `previous_record_hash` chain that
 survives process restart.
+
+**Read-side retrieval (PR4):** `TrustTier` is orthogonal to
+`PromotionState`. `RetrievalGate` enforces scope, trust floor, expiry, and
+revocation (fail-closed) and appends a retrieval audit trail.
+`ContextInjectionBoundary` is the only path that may surface lesson text
+into agent context; denials raise or omit content and never leak payloads.
