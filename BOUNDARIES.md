@@ -4,6 +4,10 @@
 - Append-only ledger: records are never rewritten or removed.
 - Fail-closed pre-write gate (Phylax-owned protocol): a gate failure means
   the record is not persisted. No fallback, no self-redaction.
+- Production construction via `Ledger.secure(gate=...)` (or
+  `require_gate=True`); never silently default to `gate=None`.
+- Durable backends (SQLite) use transactional append with a tamper-evident
+  `record_hash` / `previous_record_hash` chain.
 - UTC timestamps on every record; promotion transitions require reviewer +
   reason; graduation requires a decision_ref.
 
