@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
+import threading
 from pathlib import Path
 
 import pytest
 
-from anamnesis import Ledger, MemoryEntry
+from anamnesis import HashChainIntegrityError, Ledger, LedgerRecord, MemoryEntry
 from anamnesis.ledger import (
     GENESIS_HASH,
     MemoryLedgerBackend,
@@ -181,3 +184,89 @@ def test_sqlite_ordering_stable_across_reopen(tmp_path: Path):
     lessons = [r.entry.lesson for r in again.records()]
     assert lessons == [f"L{i}" for i in range(10)]
     assert [r.sequence for r in again.records()] == list(range(1, 11))
+
+
+def _tamper_lesson(db: Path, new_lesson: str = "tampered") -> None:
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE ledger_records SET lesson = ? WHERE sequence = 1", (new_lesson,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sqlite_tamper_detected_on_open(tmp_path: Path):
+    db = tmp_path / "tamper-open.db"
+    ledger = Ledger.secure(gate=_AcceptGate(), backend=SQLiteLedgerBackend(db))
+    ledger.record(_entry("a"))
+    ledger.record(_entry("b"))
+    _tamper_lesson(db)
+    with pytest.raises(HashChainIntegrityError, match="integrity"):
+        SQLiteLedgerBackend(db)
+
+
+def test_sqlite_tamper_detected_on_read(tmp_path: Path):
+    db = tmp_path / "tamper-read.db"
+    backend = SQLiteLedgerBackend(db)
+    ledger = Ledger.secure(gate=_AcceptGate(), backend=backend)
+    ledger.record(_entry("a"))
+    ledger.record(_entry("b"))
+    _tamper_lesson(db)
+    with pytest.raises(HashChainIntegrityError, match="integrity"):
+        backend.load()
+    with pytest.raises(HashChainIntegrityError, match="integrity"):
+        ledger.records()
+
+
+def test_sqlite_two_writers_end_with_single_valid_chain(tmp_path: Path):
+    """Two Ledger objects on one DB file must not fork; both appends linearize."""
+    db = tmp_path / "fork.db"
+    barrier = threading.Barrier(2)
+    recorded: list[LedgerRecord] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def writer(run_id: str) -> None:
+        try:
+            ledger = Ledger.secure(
+                gate=_AcceptGate(),
+                backend=SQLiteLedgerBackend(db),
+            )
+            barrier.wait(timeout=10)
+            rec = ledger.record(_entry(run_id, lesson=f"lesson-{run_id}"))
+            with lock:
+                recorded.append(rec)
+        except BaseException as exc:  # noqa: BLE001 — collect for assertion
+            with lock:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer, args=("w1",)),
+        threading.Thread(target=writer, args=("w2",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == [], errors
+    restored = SQLiteLedgerBackend(db).load()
+    assert len(restored) == 2
+    assert verify_hash_chain(restored) is True
+    assert restored[0].previous_record_hash == GENESIS_HASH
+    assert restored[1].previous_record_hash == restored[0].record_hash
+    prevs = [r.previous_record_hash for r in restored]
+    assert len(set(prevs)) == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_sqlite_db_wal_shm_are_mode_0600(tmp_path: Path):
+    db = tmp_path / "perms.db"
+    ledger = Ledger.secure(gate=_AcceptGate(), backend=SQLiteLedgerBackend(db))
+    ledger.record(_entry("perm"))
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(f"{db}{suffix}") if suffix else db
+        if not path.exists():
+            continue
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600, f"{path.name} mode {oct(mode)} != 0o600"
