@@ -13,11 +13,13 @@ agent context, and it never returns unauthorized or expired content.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Callable
 
+from .ledger import HashChainIntegrityError, Ledger
 from .promotion import PromotionState
 
 
@@ -49,6 +51,9 @@ class DenyReason(StrEnum):
     SCOPE_DENIED = "scope_denied"
     EMPTY_PRINCIPAL = "empty_principal"
     EMPTY_SCOPE = "empty_scope"
+    UNKNOWN_PRINCIPAL = "unknown_principal"
+    LESSON_MISMATCH = "lesson_mismatch"
+    EVALUATION_ERROR = "evaluation_error"
 
 
 def _utc_now_iso() -> str:
@@ -81,6 +86,19 @@ class RetrievalPrincipal:
             raise ValueError("principal_id is required")
         if not self.task_scope.strip():
             raise ValueError("task_scope is required")
+
+
+class PrincipalRegistry:
+    """Explicit allowlist of retrieval principals.
+
+    Fail closed: an empty registry denies every principal.
+    """
+
+    def __init__(self, principal_ids: Iterable[str] = ()) -> None:
+        self._ids = frozenset(pid.strip() for pid in principal_ids if str(pid).strip())
+
+    def contains(self, principal_id: str) -> bool:
+        return principal_id in self._ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +299,7 @@ class RetrievalGate:
     """Evaluate whether a principal may retrieve a memory entry.
 
     ``promotion_state`` is recorded for audit only — it never grants access.
+    Unknown principals are denied. An empty ``PrincipalRegistry`` denies all.
     """
 
     def __init__(
@@ -288,10 +307,12 @@ class RetrievalGate:
         registry: AuthorizationRegistry,
         auditor: RetrievalAuditor | None = None,
         *,
+        principals: PrincipalRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._registry = registry
         self._auditor = auditor if auditor is not None else RetrievalAuditor()
+        self._principals = principals if principals is not None else PrincipalRegistry()
         self._clock = clock or (lambda: datetime.now(UTC))
 
     @property
@@ -305,8 +326,24 @@ class RetrievalGate:
         *,
         promotion_state: PromotionState | None = None,
     ) -> RetrievalVerdict:
-        auth = self._registry.get(provenance_ref)
-        decision, reason = self._decide(auth, principal)
+        auth: AuthorizationRecord | None = None
+        try:
+            auth = self._registry.get(provenance_ref)
+            decision, reason = self._decide(auth, principal)
+        except Exception:
+            event = RetrievalAuditEvent(
+                provenance_ref=provenance_ref,
+                principal_id=getattr(principal, "principal_id", ""),
+                task_scope=getattr(principal, "task_scope", ""),
+                decision=RetrievalDecision.DENY,
+                reason=DenyReason.EVALUATION_ERROR,
+                at=_utc_now_iso(),
+                trust_tier=auth.trust_tier if auth else None,
+                promotion_state=promotion_state,
+                min_trust_required=getattr(principal, "min_trust", TrustTier.UNTRUSTED),
+            )
+            self._auditor.append(event)
+            raise
         event = RetrievalAuditEvent(
             provenance_ref=provenance_ref,
             principal_id=principal.principal_id,
@@ -331,6 +368,12 @@ class RetrievalGate:
         auth: AuthorizationRecord | None,
         principal: RetrievalPrincipal,
     ) -> tuple[RetrievalDecision, str]:
+        if not principal.principal_id.strip():
+            return RetrievalDecision.DENY, DenyReason.EMPTY_PRINCIPAL
+        if not principal.task_scope.strip():
+            return RetrievalDecision.DENY, DenyReason.EMPTY_SCOPE
+        if not self._principals.contains(principal.principal_id):
+            return RetrievalDecision.DENY, DenyReason.UNKNOWN_PRINCIPAL
         if auth is None:
             return RetrievalDecision.DENY, DenyReason.UNKNOWN_ENTRY
         if auth.is_revoked:
@@ -365,11 +408,80 @@ class ContextInjectionBoundary:
 
     Lesson text reaches agent context only through ``inject`` /
     ``inject_one``. Denied or expired entries are audited and omitted
-    (batch) or raise (single). Raw ledger reads are not a substitute.
+    (batch) or raise (single). Lesson text is taken from the verified
+    ledger by ``provenance_ref``; caller-supplied ``InjectCandidate.lesson``
+    is never injected. Raw ledger reads are not a substitute.
     """
 
-    def __init__(self, gate: RetrievalGate) -> None:
+    def __init__(self, gate: RetrievalGate, ledger: Ledger) -> None:
         self._gate = gate
+        self._ledger = ledger
+
+    def _audit_deny(
+        self,
+        provenance_ref: str,
+        principal: RetrievalPrincipal,
+        reason: str,
+        *,
+        promotion_state: PromotionState | None,
+        auth: AuthorizationRecord | None,
+    ) -> RetrievalVerdict:
+        event = RetrievalAuditEvent(
+            provenance_ref=provenance_ref,
+            principal_id=principal.principal_id,
+            task_scope=principal.task_scope,
+            decision=RetrievalDecision.DENY,
+            reason=reason,
+            at=_utc_now_iso(),
+            trust_tier=auth.trust_tier if auth else None,
+            promotion_state=promotion_state,
+            min_trust_required=principal.min_trust,
+        )
+        self._gate.auditor.append(event)
+        return RetrievalVerdict(
+            decision=RetrievalDecision.DENY,
+            reason=reason,
+            auth=auth,
+            audit=event,
+        )
+
+    def _lesson_from_ledger(
+        self,
+        provenance_ref: str,
+        claimed_lesson: str,
+        principal: RetrievalPrincipal,
+        *,
+        promotion_state: PromotionState | None,
+        auth: AuthorizationRecord | None,
+    ) -> tuple[str, RetrievalVerdict | None]:
+        try:
+            stored = self._ledger.record_for_provenance(provenance_ref)
+        except HashChainIntegrityError:
+            return "", self._audit_deny(
+                provenance_ref,
+                principal,
+                DenyReason.UNKNOWN_ENTRY,
+                promotion_state=promotion_state,
+                auth=auth,
+            )
+        if stored is None:
+            return "", self._audit_deny(
+                provenance_ref,
+                principal,
+                DenyReason.UNKNOWN_ENTRY,
+                promotion_state=promotion_state,
+                auth=auth,
+            )
+        lesson = stored.entry.lesson
+        if claimed_lesson != lesson:
+            return "", self._audit_deny(
+                provenance_ref,
+                principal,
+                DenyReason.LESSON_MISMATCH,
+                promotion_state=promotion_state,
+                auth=auth,
+            )
+        return lesson, None
 
     def inject_one(
         self,
@@ -383,9 +495,18 @@ class ContextInjectionBoundary:
         )
         if not verdict.allowed or verdict.auth is None:
             raise UnauthorizedContextError(verdict)
+        lesson, deny = self._lesson_from_ledger(
+            candidate.provenance_ref,
+            candidate.lesson,
+            principal,
+            promotion_state=candidate.promotion_state,
+            auth=verdict.auth,
+        )
+        if deny is not None:
+            raise UnauthorizedContextError(deny)
         return ContextFragment(
             provenance_ref=candidate.provenance_ref,
-            lesson=candidate.lesson,
+            lesson=lesson,
             trust_tier=verdict.auth.trust_tier,
             promotion_state=candidate.promotion_state,
             decision_ref=verdict.auth.decision_ref,
@@ -411,18 +532,28 @@ class ContextInjectionBoundary:
                 principal,
                 promotion_state=candidate.promotion_state,
             )
-            if verdict.allowed and verdict.auth is not None:
-                allowed.append(
-                    ContextFragment(
-                        provenance_ref=candidate.provenance_ref,
-                        lesson=candidate.lesson,
-                        trust_tier=verdict.auth.trust_tier,
-                        promotion_state=candidate.promotion_state,
-                        decision_ref=verdict.auth.decision_ref,
-                    )
-                )
-            else:
+            if not verdict.allowed or verdict.auth is None:
                 denied.append(verdict)
+                continue
+            lesson, deny = self._lesson_from_ledger(
+                candidate.provenance_ref,
+                candidate.lesson,
+                principal,
+                promotion_state=candidate.promotion_state,
+                auth=verdict.auth,
+            )
+            if deny is not None:
+                denied.append(deny)
+                continue
+            allowed.append(
+                ContextFragment(
+                    provenance_ref=candidate.provenance_ref,
+                    lesson=lesson,
+                    trust_tier=verdict.auth.trust_tier,
+                    promotion_state=candidate.promotion_state,
+                    decision_ref=verdict.auth.decision_ref,
+                )
+            )
         if require_all and denied:
             raise UnauthorizedContextError(denied[0])
         return InjectedContext(fragments=tuple(allowed), denied=tuple(denied))
