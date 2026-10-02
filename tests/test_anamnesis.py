@@ -19,7 +19,7 @@ def _entry(run_id: str = "run-1") -> MemoryEntry:
 
 
 def test_ledger_records_with_utc_timestamp_and_is_append_only():
-    ledger = Ledger()
+    ledger = Ledger.unrestricted_for_tests()
     ledger.record(_entry("run-1"))
     first = ledger.records()
     ledger.record(_entry("run-2"))
@@ -38,7 +38,7 @@ def test_pre_write_gate_is_fail_closed():
         def gate(self, entry):
             raise ValueError("unredacted content rejected")
 
-    ledger = Ledger(gate=RejectingGate())
+    ledger = Ledger.secure(gate=RejectingGate())
     with pytest.raises(ValueError, match="unredacted"):
         ledger.record(_entry())
     assert ledger.records() == ()  # nothing persisted on gate failure
@@ -56,16 +56,15 @@ def test_pre_write_gate_can_transform_before_acceptance():
                 recorded_at=entry.recorded_at,
             )
 
-    ledger = Ledger(gate=RedactingGate())
+    ledger = Ledger.secure(gate=RedactingGate())
     ledger.record(_entry())
     assert ledger.records()[0].entry.lesson.startswith("redacted:")
     assert ledger.records()[0].accepted_by_gate == "phylax-redaction"
 
 
 def test_promotion_state_machine_is_forward_only_with_graduation_gate():
-    ledger = Ledger()
+    ledger = Ledger.unrestricted_for_tests()
     pipeline = PromotionPipeline(ledger)
-    record = pipeline_state = None
     record = ledger.record(_entry("run-promote"))
     pipeline.submit(record)
 
@@ -86,7 +85,7 @@ def test_promotion_state_machine_is_forward_only_with_graduation_gate():
 
 
 def test_rejection_is_recorded_and_terminal():
-    ledger = Ledger()
+    ledger = Ledger.unrestricted_for_tests()
     pipeline = PromotionPipeline(ledger)
     pipeline.submit(ledger.record(_entry("run-reject")))
     state = pipeline.reject("prov:run-reject", reviewer="operator", reason="superseded")
