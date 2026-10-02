@@ -21,10 +21,22 @@
   plus chmod after WAL files appear).
 - UTC timestamps on every record; promotion transitions require reviewer +
   reason; graduation requires a decision_ref.
+- Trust tiers are orthogonal to promotion lifecycle; graduation never
+  grants retrieval trust, and trust never implies graduation.
+- Retrieval checks expiry and revocation fail-closed; every evaluate /
+  inject attempt is append-only audited (including evaluation exceptions).
+- Principals not in an explicit `PrincipalRegistry` are denied; an empty
+  registry denies all.
+- Agent context receives lesson text only via `ContextInjectionBoundary`,
+  resolved from the verified ledger by `provenance_ref` (caller-supplied
+  lesson text is never trusted; missing or mismatched refs are denied).
 
 ## Never do
 - Never strip/redact memory content inside anamnesis (Phylax owns policy).
 - Never import runtime orchestration (perpetua-core), endpoint/transport
   (telos), or hardware selection (agate) into this repo.
 - Never promote without evidence (decision_ref) or skip states.
+- Never treat graduated lifecycle as sufficient for retrieval trust.
+- Never inject unauthorized, expired, or revoked memory into agent context.
+- Never inject caller-supplied lesson text; only ledger-resolved text.
 - Never push/merge without operator authorization (program control).
