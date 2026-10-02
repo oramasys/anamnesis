@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass, replace
@@ -22,6 +23,16 @@ from pathlib import Path
 from typing import Protocol
 
 GENESIS_HASH = "0" * 64
+
+# Existing databases created before previous_record_hash was UNIQUE still
+# open: CREATE TABLE IF NOT EXISTS leaves the old schema in place, and
+# ``CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_previous_record_hash``
+# adds the uniqueness rule. Open fails closed if a fork is already stored.
+_PREVIOUS_HASH_INDEX = "idx_ledger_previous_record_hash"
+
+
+class HashChainIntegrityError(ValueError):
+    """Raised when the append-only hash chain does not verify (fail closed)."""
 
 
 def _utc_now_iso() -> str:
@@ -119,6 +130,12 @@ def verify_hash_chain(records: tuple[LedgerRecord, ...] | list[LedgerRecord]) ->
     return True
 
 
+def assert_hash_chain(records: tuple[LedgerRecord, ...] | list[LedgerRecord]) -> None:
+    """Fail closed if the hash chain does not verify."""
+    if not verify_hash_chain(records):
+        raise HashChainIntegrityError("ledger hash chain integrity check failed")
+
+
 class LedgerBackend(Protocol):
     """Persistence boundary for ledger records (memory or SQLite)."""
 
@@ -144,17 +161,35 @@ class MemoryLedgerBackend:
 
     def append(self, record: LedgerRecord) -> LedgerRecord:
         with self._lock:
+            assert_hash_chain(self._records)
+            previous = (
+                self._records[-1].record_hash if self._records else GENESIS_HASH
+            )
+            record_hash = compute_record_hash(
+                record.entry,
+                record.accepted_by_gate,
+                record.recorded_at,
+                previous,
+            )
             seq = len(self._records) + 1
-            stored = replace(record, sequence=seq)
+            stored = replace(
+                record,
+                sequence=seq,
+                record_hash=record_hash,
+                previous_record_hash=previous,
+            )
             self._records.append(stored)
             return stored
 
     def load(self) -> tuple[LedgerRecord, ...]:
         with self._lock:
-            return tuple(self._records)
+            records = tuple(self._records)
+        assert_hash_chain(records)
+        return records
 
     def last_hash(self) -> str:
         with self._lock:
+            assert_hash_chain(self._records)
             if not self._records:
                 return GENESIS_HASH
             return self._records[-1].record_hash
@@ -174,7 +209,7 @@ class SQLiteLedgerBackend:
         accepted_by_gate TEXT NOT NULL,
         recorded_at TEXT NOT NULL,
         record_hash TEXT NOT NULL UNIQUE,
-        previous_record_hash TEXT NOT NULL,
+        previous_record_hash TEXT NOT NULL UNIQUE,
         UNIQUE (provenance_ref)
     );
     """
@@ -183,14 +218,43 @@ class SQLiteLedgerBackend:
         self._path = Path(path)
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             conn.execute(self._SCHEMA)
-            conn.commit()
+            try:
+                conn.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {_PREVIOUS_HASH_INDEX} "
+                    "ON ledger_records(previous_record_hash)"
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HashChainIntegrityError(
+                    "cannot enforce unique previous_record_hash; "
+                    "a chain fork is already present in this database"
+                ) from exc
+            self._assert_chain(conn)
+        finally:
+            conn.close()
+
+    def _chmod_db_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{self._path}{suffix}") if suffix else self._path
+            if path.exists():
+                os.chmod(path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._path, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        old_umask = os.umask(0o077)
+        try:
+            conn = sqlite3.connect(
+                self._path,
+                isolation_level=None,
+                timeout=30.0,
+            )
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        finally:
+            os.umask(old_umask)
+        self._chmod_db_files()
         return conn
 
     @staticmethod
@@ -198,12 +262,43 @@ class SQLiteLedgerBackend:
         """Commit hook (patchable in tests to simulate crash-before-commit)."""
         conn.commit()
 
+    def _load_records(self, conn: sqlite3.Connection) -> tuple[LedgerRecord, ...]:
+        rows = conn.execute(
+            """
+            SELECT sequence, run_id, lesson, provenance_ref, source,
+                   entry_recorded_at, accepted_by_gate, recorded_at,
+                   record_hash, previous_record_hash
+            FROM ledger_records
+            ORDER BY sequence ASC
+            """
+        ).fetchall()
+        return tuple(self._row_to_record(row) for row in rows)
+
+    def _assert_chain(self, conn: sqlite3.Connection) -> tuple[LedgerRecord, ...]:
+        records = self._load_records(conn)
+        assert_hash_chain(records)
+        return records
+
+    def _tip_hash(self, conn: sqlite3.Connection) -> str:
+        row = conn.execute(
+            "SELECT record_hash FROM ledger_records ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else GENESIS_HASH
+
     def append(self, record: LedgerRecord) -> LedgerRecord:
         entry = record.entry
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                self._assert_chain(conn)
+                previous = self._tip_hash(conn)
+                record_hash = compute_record_hash(
+                    entry,
+                    record.accepted_by_gate,
+                    record.recorded_at,
+                    previous,
+                )
                 cur = conn.execute(
                     """
                     INSERT INTO ledger_records (
@@ -220,13 +315,27 @@ class SQLiteLedgerBackend:
                         entry.recorded_at,
                         record.accepted_by_gate,
                         record.recorded_at,
-                        record.record_hash,
-                        record.previous_record_hash,
+                        record_hash,
+                        previous,
                     ),
                 )
                 seq = int(cur.lastrowid)
                 self._commit(conn)
-                return replace(record, sequence=seq)
+                return replace(
+                    record,
+                    sequence=seq,
+                    record_hash=record_hash,
+                    previous_record_hash=previous,
+                )
+            except sqlite3.IntegrityError as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise HashChainIntegrityError(
+                    "append rejected: unique chain constraint violated "
+                    "(forked previous_record_hash or duplicate provenance)"
+                ) from exc
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
@@ -240,29 +349,18 @@ class SQLiteLedgerBackend:
         with self._lock:
             conn = self._connect()
             try:
-                rows = conn.execute(
-                    """
-                    SELECT sequence, run_id, lesson, provenance_ref, source,
-                           entry_recorded_at, accepted_by_gate, recorded_at,
-                           record_hash, previous_record_hash
-                    FROM ledger_records
-                    ORDER BY sequence ASC
-                    """
-                ).fetchall()
+                return self._assert_chain(conn)
             finally:
                 conn.close()
-        return tuple(self._row_to_record(row) for row in rows)
 
     def last_hash(self) -> str:
         with self._lock:
             conn = self._connect()
             try:
-                row = conn.execute(
-                    "SELECT record_hash FROM ledger_records ORDER BY sequence DESC LIMIT 1"
-                ).fetchone()
+                self._assert_chain(conn)
+                return self._tip_hash(conn)
             finally:
                 conn.close()
-        return row[0] if row else GENESIS_HASH
 
     @staticmethod
     def _row_to_record(row: tuple) -> LedgerRecord:
@@ -355,20 +453,28 @@ class Ledger:
             gated = stamped_entry
             gate_name = "none-configured"
         recorded_at = _utc_now_iso()
+        record = LedgerRecord(
+            entry=gated,
+            accepted_by_gate=gate_name,
+            recorded_at=recorded_at,
+        )
         with self._lock:
-            previous = self._backend.last_hash()
-            record_hash = compute_record_hash(
-                gated, gate_name, recorded_at, previous
-            )
-            record = LedgerRecord(
-                entry=gated,
-                accepted_by_gate=gate_name,
-                recorded_at=recorded_at,
-                record_hash=record_hash,
-                previous_record_hash=previous,
-            )
             return self._backend.append(record)
 
     def records(self) -> tuple[LedgerRecord, ...]:
         with self._lock:
-            return self._backend.load()
+            loaded = self._backend.load()
+        assert_hash_chain(loaded)
+        return loaded
+
+    def record_for_provenance(self, provenance_ref: str) -> LedgerRecord | None:
+        """Return the unique ledger record for ``provenance_ref``, if present.
+
+        Reads through ``records()`` so a broken hash chain fails closed.
+        """
+        matches = [
+            rec for rec in self.records() if rec.entry.provenance_ref == provenance_ref
+        ]
+        if not matches:
+            return None
+        return matches[0]

@@ -17,10 +17,17 @@ silent production default; tests may use `Ledger.unrestricted_for_tests()`.
 
 **Durable provenance (PR2):** `SQLiteLedgerBackend` provides transactional
 append and a SHA-256 `record_hash` / `previous_record_hash` chain that
-survives process restart.
+survives process restart. The chain is verified on open, read, and before
+linking a new record (fail closed). `previous_record_hash` is UNIQUE;
+existing databases receive `idx_ledger_previous_record_hash` on open.
+Append reads the tip hash inside `BEGIN IMMEDIATE` on the same connection.
+Database, WAL, and SHM files are mode 0600.
 
-**Read-side retrieval (PR4):** `TrustTier` is orthogonal to
-`PromotionState`. `RetrievalGate` enforces scope, trust floor, expiry, and
-revocation (fail-closed) and appends a retrieval audit trail.
+**Read-side retrieval (PR3):** `TrustTier` is orthogonal to
+`PromotionState`. `RetrievalGate` enforces an explicit principal registry
+(empty registry denies all), scope, trust floor, expiry, and revocation
+(fail-closed) and appends a retrieval audit trail.
 `ContextInjectionBoundary` is the only path that may surface lesson text
-into agent context; denials raise or omit content and never leak payloads.
+into agent context; lesson text is resolved from the verified ledger by
+`provenance_ref` (caller-supplied text is never trusted). Denials raise or
+omit content and never leak payloads.

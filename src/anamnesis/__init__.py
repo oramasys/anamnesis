@@ -2,6 +2,7 @@
 
 from .ledger import (
     GENESIS_HASH,
+    HashChainIntegrityError,
     Ledger,
     LedgerBackend,
     LedgerRecord,
@@ -9,6 +10,7 @@ from .ledger import (
     MemoryLedgerBackend,
     PreWriteGate,
     SQLiteLedgerBackend,
+    assert_hash_chain,
     compute_record_hash,
     verify_hash_chain,
 )
@@ -37,6 +39,7 @@ __all__ = [
     "ContextInjectionBoundary",
     "DenyReason",
     "GENESIS_HASH",
+    "HashChainIntegrityError",
     "InjectCandidate",
     "InjectedContext",
     "Ledger",
@@ -55,6 +58,7 @@ __all__ = [
     "SQLiteLedgerBackend",
     "TrustTier",
     "UnauthorizedContextError",
+    "assert_hash_chain",
     "compute_record_hash",
     "verify_hash_chain",
 ]
